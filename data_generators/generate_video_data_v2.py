@@ -12,6 +12,9 @@
     基础内容风险（K）：教育 1，游戏 3.5，搞笑 3，生活 2
     时长诱导乘数（D）：短 1.5，中 1.0，长 0.8
 - 分发成本 c = 0.001 × t
+- 最大曝光次数 N：Type I Pareto（xmin=18, α=1.28），floor 后截断到 [20, 1000]
+  numpy Generator.pareto 为 Lomax，故 N 的连续原像为 xmin * (1 + Lomax(α))
+  使用独立种子 N_RNG_SEED，不占用主 RNG（类别/时长）的随机流
 """
 
 from __future__ import annotations
@@ -19,9 +22,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-N_VIDEOS = 50_000
+N_VIDEOS = 5_000
 RNG_SEED = 42
-OUTPUT_PATH = "videos_5w.csv"
+N_RNG_SEED = 20260411  # N 单独抽样，与主种子 42 解耦
+OUTPUT_PATH = "videos.csv"
 
 # 对数正态：ln(t) ~ N(mu_ln, sigma_ln)，使 E[t] ≈ exp(mu_ln + sigma_ln^2/2) ≈ 2（截断前）
 SIGMA_LN = 1.0
@@ -38,6 +42,11 @@ BASE_RISK = np.array([0.0, 1.0, 3.5, 3.0, 2.0], dtype=np.float64)
 
 # D→时长诱导乘数：1→1.5，2→1.0，3→0.8
 MULT_BY_D = np.array([0.0, 1.5, 1.0, 0.8], dtype=np.float64)
+
+# Type I Pareto：xmin * (1 + Lomax(α))；floor 后 clip 到 [N_MIN, N_MAX]
+N_XMIN = 18.0
+N_ALPHA = 1.28
+N_MIN, N_MAX = 20, 1000
 
 
 def sample_duration(rng: np.random.Generator, n: int) -> np.ndarray:
@@ -62,6 +71,12 @@ def compute_r(K: np.ndarray, D: np.ndarray) -> np.ndarray:
     return np.round(base * mult, 6)
 
 
+def sample_exposure_cap(rng: np.random.Generator, n: int) -> np.ndarray:
+    """Type I Pareto 抽样最大曝光次数 N，floor 后截断到 [N_MIN, N_MAX]。"""
+    raw = N_XMIN * (1.0 + rng.pareto(N_ALPHA, size=n))
+    return np.clip(np.floor(raw).astype(np.int64), N_MIN, N_MAX)
+
+
 def main() -> None:
     rng = np.random.default_rng(RNG_SEED)
 
@@ -77,6 +92,9 @@ def main() -> None:
     cost_coef = 0.001
     c = cost_coef * t
 
+    n_rng = np.random.default_rng(N_RNG_SEED)
+    N = sample_exposure_cap(n_rng, N_VIDEOS)
+
     df = pd.DataFrame(
         {
             "video_id": np.arange(1, N_VIDEOS + 1, dtype=np.int64),
@@ -87,6 +105,7 @@ def main() -> None:
             "education_flag": education_flag,
             "r": r,
             "c": np.round(c, 6),
+            "N": N,
         }
     )
 
@@ -104,6 +123,12 @@ def main() -> None:
     )
     print(f"沉迷风险 r：min={df['r'].min():.4f}, max={df['r'].max():.4f}")
     print(f"分发成本 c：min={df['c'].min():.6f}, max={df['c'].max():.6f}（c = {cost_coef} × t）")
+    print(
+        f"最大曝光 N：均值 {df['N'].mean():.2f}，"
+        f"min={int(df['N'].min())}, max={int(df['N'].max())}，"
+        f"P50={int(df['N'].median())}"
+        f"（Pareto xmin={N_XMIN:g}, α={N_ALPHA}，clip [{N_MIN}, {N_MAX}]）"
+    )
 
 
 if __name__ == "__main__":
