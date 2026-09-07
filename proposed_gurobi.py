@@ -241,6 +241,52 @@ def compute_delta_starts(
     return dT, dR, dA, dE
 
 
+def actual_gap_pct(incumbent: float, proven_bound: float) -> float | None:
+    """Actual Gap = ((Best Bound - Incumbent) / |Incumbent|) × 100%."""
+    if abs(incumbent) < 1e-12:
+        return None
+    return ((proven_bound - incumbent) / abs(incumbent)) * 100.0
+
+
+def print_active_soft_slacks(
+    all_users: list[int],
+    delta_T: dict,
+    delta_R: dict,
+    delta_A: dict,
+    delta_E: dict,
+    tol: float = 1e-6,
+    top_n: int = 5,
+) -> None:
+    """Print which soft-constraint slacks are active (δ > tol) in the incumbent."""
+    groups = (
+        ("time (δ_T)", delta_T),
+        ("risk (δ_R)", delta_R),
+        ("ent  (δ_A)", delta_A),
+        ("edu  (δ_E)", delta_E),
+    )
+    print("--- Active soft constraints (δ > 0) ---")
+    any_active = False
+    total_slack_sum = 0.0
+    for label, deltas in groups:
+        active = [(u, float(deltas[u].X)) for u in all_users if float(deltas[u].X) > tol]
+        active.sort(key=lambda t: t[1], reverse=True)
+        n_active = len(active)
+        slack_sum = sum(v for _, v in active)
+        total_slack_sum += slack_sum
+        if n_active:
+            any_active = True
+        print(f"  {label}: {n_active}/{len(all_users)} users, sum={slack_sum:.6g}")
+        for u, v in active[:top_n]:
+            print(f"    user {u}: δ={v:.6g}")
+        if n_active > top_n:
+            print(f"    ... and {n_active - top_n} more")
+    if not any_active:
+        print("  (none — all soft constraints satisfied with δ=0)")
+    else:
+        print(f"  total Σδ = {total_slack_sum:.6g}")
+        print(f"  penalty term = {PENALTY_COEFF * total_slack_sum:.6g}")
+
+
 def build_result_payload(
     status: int,
     objective: float | None,
@@ -251,6 +297,9 @@ def build_result_payload(
     users_data: dict[int, dict],
     user_video_data: dict[int, dict[int, dict]],
     videos_data: dict[int, dict],
+    incumbent_objective: float | None = None,
+    proven_bound: float | None = None,
+    actual_gap: float | None = None,
 ) -> dict:
     push_info: list[dict] = []
     for u in sorted(pushes_by_user.keys()):
@@ -279,6 +328,9 @@ def build_result_payload(
     return {
         "status": grb_status_to_label(status),
         "objective": objective,
+        "incumbent_objective": incumbent_objective,
+        "proven_bound": proven_bound,
+        "actual_gap": actual_gap,
         "value": total_value,
         "risk": total_risk,
         "cost": total_cost,
@@ -328,8 +380,8 @@ def solve(
 
     delta_T = model.addVars(all_users, lb=0.0, vtype=GRB.CONTINUOUS, name="delta_T")
     delta_R = model.addVars(all_users, lb=0.0, vtype=GRB.CONTINUOUS, name="delta_R")
-    delta_A = model.addVars(all_users, lb=0, vtype=GRB.INTEGER, name="delta_A")
-    delta_E = model.addVars(all_users, lb=0, vtype=GRB.INTEGER, name="delta_E")
+    delta_A = model.addVars(all_users, lb=0.0, vtype=GRB.INTEGER, name="delta_A")
+    delta_E = model.addVars(all_users, lb=0.0, vtype=GRB.INTEGER, name="delta_E")
 
     obj_x = gp.quicksum(obj_coeff[uv] * x[uv] for uv in u_v_pairs)
     obj_pen = PENALTY_COEFF * gp.quicksum(
@@ -438,9 +490,16 @@ def solve(
     print(f"Status: {grb_status_to_label(status)} (code {status})")
 
     if model.SolCount > 0:
-        print(f"Objective: {model.ObjVal:.6g}")
-        if getattr(model, "IsMIP", 0):
-            print(f"Best bound: {model.ObjBound:.6g}")
+        incumbent = float(model.ObjVal)
+        proven_bound = float(model.ObjBound)
+        gap_pct = actual_gap_pct(incumbent, proven_bound)
+
+        print(f"Incumbent Objective: {incumbent:.6g}")
+        print(f"Proven Bound: {proven_bound:.6g}")
+        if gap_pct is None:
+            print("Actual Gap: N/A (incumbent ≈ 0)")
+        else:
+            print(f"Actual Gap: {gap_pct:.6g}%")
         print(f"Binary x count: {len(u_v_pairs)}")
 
         chosen = [(u, v) for (u, v) in u_v_pairs if x[u, v].X > 0.5]
@@ -451,13 +510,15 @@ def solve(
         print(f"Total push cost: {total_cost:.10g}")
         print(f"Total push risk: {total_risk:.10g}")
 
+        print_active_soft_slacks(all_users, delta_T, delta_R, delta_A, delta_E)
+
         by_user: dict[int, list[int]] = defaultdict(list)
         for u, v in chosen:
             by_user[u].append(v)
 
         payload = build_result_payload(
             status=status,
-            objective=float(model.ObjVal),
+            objective=incumbent,
             total_value=total_value,
             total_cost=total_cost,
             total_risk=total_risk,
@@ -465,6 +526,9 @@ def solve(
             users_data=users_data,
             user_video_data=user_video_data,
             videos_data=videos_data,
+            incumbent_objective=incumbent,
+            proven_bound=proven_bound,
+            actual_gap=gap_pct,
         )
         RESULT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(RESULT_JSON_PATH, "w", encoding="utf-8") as jf:

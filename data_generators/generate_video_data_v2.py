@@ -12,9 +12,13 @@
     基础内容风险（K）：教育 1，游戏 3.5，搞笑 3，生活 2
     时长诱导乘数（D）：短 1.5，中 1.0，长 0.8
 - 分发成本 c = 0.001 × t
-- 最大曝光次数 N：Type I Pareto（xmin=18, α=1.28），floor 后截断到 [20, 1000]
-  numpy Generator.pareto 为 Lomax，故 N 的连续原像为 xmin * (1 + Lomax(α))
-  使用独立种子 N_RNG_SEED，不占用主 RNG（类别/时长）的随机流
+- 最大曝光次数 N_j：
+  NumPy rng.pareto(α) 生成的是 Lomax / Pareto-II 变量 Y（支撑 [0, ∞)），
+  不是 xmin=18 的 Type-I Pareto。转换：
+      Y ~ Lomax(α = 1.28)          # rng.pareto(1.28)
+      N_j^* = 18 * (1 + Y)         # Type-I Pareto, x_min = 18
+      N_j = clip(floor(N_j^*), 20, 1000)
+  使用独立种子 N_RNG_SEED=20260411，不占用主 RNG（类别/时长，种子 42）的随机流
 """
 
 from __future__ import annotations
@@ -43,7 +47,8 @@ BASE_RISK = np.array([0.0, 1.0, 3.5, 3.0, 2.0], dtype=np.float64)
 # D→时长诱导乘数：1→1.5，2→1.0，3→0.8
 MULT_BY_D = np.array([0.0, 1.5, 1.0, 0.8], dtype=np.float64)
 
-# Type I Pareto：xmin * (1 + Lomax(α))；floor 后 clip 到 [N_MIN, N_MAX]
+# Exposure cap N_j. numpy Generator.pareto(a) = Lomax/Pareto-II, not Type-I.
+# Type-I with x_min: N* = x_min * (1 + Y), Y ~ Lomax(α); then floor and clip.
 N_XMIN = 18.0
 N_ALPHA = 1.28
 N_MIN, N_MAX = 20, 1000
@@ -72,9 +77,20 @@ def compute_r(K: np.ndarray, D: np.ndarray) -> np.ndarray:
 
 
 def sample_exposure_cap(rng: np.random.Generator, n: int) -> np.ndarray:
-    """Type I Pareto 抽样最大曝光次数 N，floor 后截断到 [N_MIN, N_MAX]。"""
-    raw = N_XMIN * (1.0 + rng.pareto(N_ALPHA, size=n))
-    return np.clip(np.floor(raw).astype(np.int64), N_MIN, N_MAX)
+    """Draw integer exposure caps N_j.
+
+    numpy.random.Generator.pareto(α) returns Lomax / Pareto-II draws Y ≥ 0.
+    Convert to Type-I Pareto with scale x_min, then discretize:
+
+        Y ~ Lomax(α = N_ALPHA)
+        N_j^* = N_XMIN * (1 + Y)          # Type-I Pareto, x_min = 18
+        N_j = clip(floor(N_j^*), N_MIN, N_MAX)   # [20, 1000]
+    """
+    # Y ~ Lomax(α=1.28)  (Pareto-II; NOT Type-I)
+    Y = rng.pareto(N_ALPHA, size=n)
+    N_star = N_XMIN * (1.0 + Y)
+    N = np.floor(N_star).astype(np.int64)
+    return np.clip(N, N_MIN, N_MAX)
 
 
 def main() -> None:
@@ -92,6 +108,7 @@ def main() -> None:
     cost_coef = 0.001
     c = cost_coef * t
 
+    # Independent stream so N_j does not consume the K/t RNG (seed 42).
     n_rng = np.random.default_rng(N_RNG_SEED)
     N = sample_exposure_cap(n_rng, N_VIDEOS)
 
@@ -127,7 +144,8 @@ def main() -> None:
         f"最大曝光 N：均值 {df['N'].mean():.2f}，"
         f"min={int(df['N'].min())}, max={int(df['N'].max())}，"
         f"P50={int(df['N'].median())}"
-        f"（Pareto xmin={N_XMIN:g}, α={N_ALPHA}，clip [{N_MIN}, {N_MAX}]）"
+        f"（Y~Lomax(α={N_ALPHA}), N^*=xmin(1+Y), xmin={N_XMIN:g}, "
+        f"floor+clip [{N_MIN}, {N_MAX}]）"
     )
 
 
